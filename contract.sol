@@ -2,23 +2,20 @@ pragma solidity ^0.8.0;
 
 /**
  * @title TaskCampaignContract
- * @dev Simplified contract: tasks created off-chain; store funding, influencer assignments, payouts, and disputes per influencer.
- *      Improved: track influencer IDs for iteration, auto-close tasks, support cancel before assignment, ensure refunds,
- *      limit influencer count, allow reuse of IDs after removal, bulk cancel remaining, emit TaskClosed once.
+ * @dev Simplified contract: tasks created off-chain; store funding, influencer assignments, payouts, and auto-close tasks.
+ *      Removed dispute and rejection logic. Once funded, company can only pay influencers; no refunds.
  */
 contract TaskCampaignContract {
     address public admin;
     uint256 public nextTaskId;
     uint256 public constant MAX_INFLUENCERS = 100;
 
-    enum InfluencerStatus { Funded, Paid, Rejected, Disputed }
-    enum DisputeStatus { None, Open, Resolved }
+    enum InfluencerStatus { Funded, Paid }
 
     struct InfluencerInfo {
         address influencerAddress;
         uint256 reward;
         InfluencerStatus status;
-        DisputeStatus disputeStatus;
     }
 
     struct Task {
@@ -36,12 +33,8 @@ contract TaskCampaignContract {
     event TaskCancelled(uint256 indexed taskId);
     event InfluencerAdded(uint256 indexed taskId, address indexed influencerAddress, uint256 influencerID, uint256 reward);
     event InfluencerPaid(uint256 indexed taskId, address indexed influencerAddress, uint256 reward);
-    event InfluencerRejected(uint256 indexed taskId, address indexed influencerAddress);
-    event DisputeRaised(uint256 indexed taskId, address indexed party, address indexed influencerAddress);
-    event DisputeResolved(uint256 indexed taskId, address indexed winner, address indexed influencerAddress, uint256 reward);
     event TaskClosed(uint256 indexed taskId);
     event RemainingWithdrawn(uint256 indexed taskId, uint256 amount);
-    event RemainingCancelled(uint256 indexed taskId);
 
     modifier onlyAdmin() {
         require(msg.sender == admin, "Only admin");
@@ -98,25 +91,27 @@ contract TaskCampaignContract {
     /**
      * @dev Company adds influencer assignment after off-chain selection.
      */
-    function addInfluencer(uint256 _taskId, address _influencerAddress, uint256 _influencerID, uint256 _reward)
-        external
-        taskExists(_taskId)
-        onlyCompany(_taskId)
-        notClosed(_taskId)
-    {
+    function addInfluencer(
+        uint256 _taskId,
+        address _influencerAddress,
+        uint256 _influencerID,
+        uint256 _reward
+    ) external taskExists(_taskId) onlyCompany(_taskId) notClosed(_taskId) {
         Task storage t = tasks[_taskId];
         require(t.influencerIDs.length < MAX_INFLUENCERS, "Max influencers reached");
         require(!t.influencerExists[_influencerID], "Influencer already added");
         require(_reward <= t.budget, "Reward exceeds budget");
-        t.budget -= _reward; // reserve reward
+
+        // Reserve the reward amount immediately
+        t.budget -= _reward;
         t.influencers[_influencerID] = InfluencerInfo({
             influencerAddress: _influencerAddress,
             reward: _reward,
-            status: InfluencerStatus.Funded,
-            disputeStatus: DisputeStatus.None
+            status: InfluencerStatus.Funded
         });
         t.influencerExists[_influencerID] = true;
         t.influencerIDs.push(_influencerID);
+
         emit InfluencerAdded(_taskId, _influencerAddress, _influencerID, _reward);
     }
 
@@ -131,76 +126,14 @@ contract TaskCampaignContract {
     {
         Task storage t = tasks[_taskId];
         require(t.influencerExists[_influencerID], "Influencer not found");
+
         InfluencerInfo storage info = t.influencers[_influencerID];
         require(info.status == InfluencerStatus.Funded, "Influencer not eligible for payment");
+
         info.status = InfluencerStatus.Paid;
         payable(info.influencerAddress).transfer(info.reward);
         emit InfluencerPaid(_taskId, info.influencerAddress, info.reward);
-        _removeInfluencer(_taskId, _influencerID);
-        _checkAndClose(_taskId);
-    }
 
-    /**
-     * @dev Company rejects influencer's work (off-chain) and updates status.
-     */
-    function rejectInfluencer(uint256 _taskId, uint256 _influencerID)
-        external
-        taskExists(_taskId)
-        onlyCompany(_taskId)
-        notClosed(_taskId)
-    {
-        Task storage t = tasks[_taskId];
-        require(t.influencerExists[_influencerID], "Influencer not found");
-        InfluencerInfo storage info = t.influencers[_influencerID];
-        require(info.status == InfluencerStatus.Funded, "Cannot reject after payment or dispute started");
-        info.status = InfluencerStatus.Rejected;
-        t.budget += info.reward; // return reserved reward
-        emit InfluencerRejected(_taskId, info.influencerAddress);
-        _removeInfluencer(_taskId, _influencerID);
-        _checkAndClose(_taskId);
-    }
-
-    /**
-     * @dev Either party raises a dispute for a specific influencer.
-     */
-    function raiseDispute(uint256 _taskId, uint256 _influencerID)
-        external
-        taskExists(_taskId)
-        notClosed(_taskId)
-    {
-        Task storage t = tasks[_taskId];
-        require(t.influencerExists[_influencerID], "Influencer not found");
-        InfluencerInfo storage info = t.influencers[_influencerID];
-        require(msg.sender == t.company || msg.sender == info.influencerAddress, "Not involved");
-        require(info.status == InfluencerStatus.Funded, "Cannot dispute at this stage");
-        info.status = InfluencerStatus.Disputed;
-        info.disputeStatus = DisputeStatus.Open;
-        emit DisputeRaised(_taskId, msg.sender, info.influencerAddress);
-    }
-
-    /**
-     * @dev Admin resolves dispute; if influencer wins, pay from reserved funds and update status.
-     */
-    function resolveDispute(uint256 _taskId, uint256 _influencerID, bool influencerWins)
-        external
-        onlyAdmin
-        taskExists(_taskId)
-        notClosed(_taskId)
-    {
-        Task storage t = tasks[_taskId];
-        require(t.influencerExists[_influencerID], "Influencer not found");
-        InfluencerInfo storage info = t.influencers[_influencerID];
-        require(info.disputeStatus == DisputeStatus.Open && info.status == InfluencerStatus.Disputed, "No open dispute for influencer");
-        if (influencerWins) {
-            info.status = InfluencerStatus.Paid;
-            payable(info.influencerAddress).transfer(info.reward);
-            emit DisputeResolved(_taskId, info.influencerAddress, info.influencerAddress, info.reward);
-        } else {
-            info.status = InfluencerStatus.Rejected;
-            t.budget += info.reward; // return reserved reward
-            emit DisputeResolved(_taskId, t.company, info.influencerAddress, 0);
-        }
-        info.disputeStatus = DisputeStatus.Resolved;
         _removeInfluencer(_taskId, _influencerID);
         _checkAndClose(_taskId);
     }
@@ -211,15 +144,17 @@ contract TaskCampaignContract {
     function withdrawRemaining(uint256 _taskId)
         external
         taskExists(_taskId)
-        onlyCompany(_(taskId)
+        onlyCompany(_taskId)
+        notClosed(_taskId)
     {
         Task storage t = tasks[_taskId];
-        require(t.budget > 0, "No funds");
-        require(_allFinalized(_taskId), "Some influencers still pending or in dispute");
+        require(_allPaid(_taskId), "Some influencers still pending payment");
+
         uint256 amount = t.budget;
         t.budget = 0;
         t.isClosed = true;
         payable(t.company).transfer(amount);
+
         emit RemainingWithdrawn(_taskId, amount);
         emit TaskClosed(_taskId);
     }
@@ -232,9 +167,9 @@ contract TaskCampaignContract {
     }
 
     /**
-     * @dev Check if all influencers are in final states (Paid or Rejected) or disputes resolved.
+     * @dev Check if all influencers have been paid.
      */
-    function _allFinalized(uint256 _taskId) internal view returns (bool) {
+    function _allPaid(uint256 _taskId) internal view returns (bool) {
         Task storage t = tasks[_taskId];
         for (uint256 i = 0; i < t.influencerIDs.length; i++) {
             uint256 id = t.influencerIDs[i];
@@ -242,7 +177,7 @@ contract TaskCampaignContract {
                 continue;
             }
             InfluencerInfo storage info = t.influencers[id];
-            if (info.status == InfluencerStatus.Funded || (info.status == InfluencerStatus.Disputed && info.disputeStatus == DisputeStatus.Open)) {
+            if (info.status == InfluencerStatus.Funded) {
                 return false;
             }
         }
@@ -250,11 +185,11 @@ contract TaskCampaignContract {
     }
 
     /**
-     * @dev Internal: auto-close if all finalized and budget may be zero.
+     * @dev Internal: auto-close if all influencers have been paid and budget is zero.
      */
     function _checkAndClose(uint256 _taskId) internal {
         Task storage t = tasks[_taskId];
-        if (!t.isClosed && _allFinalized(_taskId) && t.budget == 0) {
+        if (!t.isClosed && _allPaid(_taskId) && t.budget == 0) {
             t.isClosed = true;
             emit TaskClosed(_taskId);
         }
@@ -267,7 +202,8 @@ contract TaskCampaignContract {
         Task storage t = tasks[_taskId];
         if (!t.influencerExists[_influencerID]) return;
         t.influencerExists[_influencerID] = false;
-        // remove from influencerIDs array
+
+        // Remove from influencerIDs array by swapping with last and popping
         for (uint256 i = 0; i < t.influencerIDs.length; i++) {
             if (t.influencerIDs[i] == _influencerID) {
                 t.influencerIDs[i] = t.influencerIDs[t.influencerIDs.length - 1];
