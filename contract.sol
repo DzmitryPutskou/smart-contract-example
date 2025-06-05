@@ -10,7 +10,7 @@ contract TaskCampaignContract {
     uint256 public nextTaskId;
     uint256 public constant MAX_INFLUENCERS = 100;
 
-    enum InfluencerStatus { Funded, Paid }
+    enum InfluencerStatus { Assigned, Paid }
 
     struct InfluencerInfo {
         address influencerAddress;
@@ -107,7 +107,7 @@ contract TaskCampaignContract {
         t.influencers[_influencerID] = InfluencerInfo({
             influencerAddress: _influencerAddress,
             reward: _reward,
-            status: InfluencerStatus.Funded
+            status: InfluencerStatus.Assigned
         });
         t.influencerExists[_influencerID] = true;
         t.influencerIDs.push(_influencerID);
@@ -128,7 +128,7 @@ contract TaskCampaignContract {
         require(t.influencerExists[_influencerID], "Influencer not found");
 
         InfluencerInfo storage info = t.influencers[_influencerID];
-        require(info.status == InfluencerStatus.Funded, "Influencer not eligible for payment");
+        require(info.status == InfluencerStatus.Assigned, "Influencer not eligible for payment");
 
         info.status = InfluencerStatus.Paid;
         payable(info.influencerAddress).transfer(info.reward);
@@ -177,7 +177,7 @@ contract TaskCampaignContract {
                 continue;
             }
             InfluencerInfo storage info = t.influencers[id];
-            if (info.status == InfluencerStatus.Funded) {
+            if (info.status == InfluencerStatus.Assigned) {
                 return false;
             }
         }
